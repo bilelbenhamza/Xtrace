@@ -50,8 +50,20 @@ DEFAULT_HEADERS = {
                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
 }
 
-# A completer toi-meme avec les process a surveiller, ex. ["zoom.us", "teams"]
-CALL_PROCESS_KEYWORDS = []
+# A completer toi-meme avec les process a surveiller. Deja pre-rempli
+# avec les apps d'appel dediees mentionnees (detection fiable car elles
+# tournent en process natif). Google Meet est a part : il tourne dans
+# le navigateur (Chrome/Safari), donc pas de process dedie a detecter --
+# c'est la detection "microphone actif" plus bas qui le couvre.
+CALL_PROCESS_KEYWORDS = [
+    "zoom.us",     # Zoom
+    "zoom",
+    "teams",       # Microsoft Teams
+    "msteams",
+    "ringover",    # Ringover (app desktop)
+    "webex",
+    "skype",
+]
 
 # Seuils d'alerte definis dans le projet (warning / critical).
 # "higher_is_worse": True -> on alerte quand la valeur DEPASSE le seuil
@@ -82,15 +94,103 @@ def is_call_process_running() -> list:
     return found
 
 
+def is_microphone_in_use() -> bool:
+    """
+    Detection best-effort de l'utilisation du micro -- utile pour capter
+    les appels dans le navigateur (Google Meet) qui n'ont pas de process
+    dedie a chercher dans la liste CALL_PROCESS_KEYWORDS.
+
+    A VALIDER sur le materiel reel : lance
+        ioreg -c AppleH13CamIn -r -l
+    pendant un appel Google Meet actif dans le navigateur, et compare
+    avec le resultat au repos, pour confirmer/ajuster la cle cherchee
+    ci-dessous. Retourne False (fail-safe) si indeterminable, plutot
+    que de bloquer un test sur un doute technique.
+    """
+    try:
+        result = subprocess.run(
+            ["ioreg", "-c", "AppleH13CamIn", "-r", "-l"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return "\"IOAudioEngineState\" = 1" in result.stdout
+    except Exception:
+        return False
+
+
 def call_is_active(force: bool = False) -> dict:
     if force:
         return {"active": False, "reason": "forced", "processes": []}
     procs = is_call_process_running()
+    mic = is_microphone_in_use()
+    active = bool(procs) or mic
+    reason = "process" if procs else ("microphone" if mic else None)
     return {
-        "active": bool(procs),
-        "reason": "process" if procs else None,
+        "active": active,
+        "reason": reason,
         "processes": procs,
     }
+
+
+# --- Identification appareil / reseau -----------------------------------
+
+def get_device_name() -> str:
+    """Nom convivial de la machine (ex. 'MacBook Air de Cyrine'), tel que
+    defini dans Reglages Systeme > Partage. Retombe sur le hostname
+    reseau si indisponible."""
+    try:
+        result = subprocess.run(
+            ["scutil", "--get", "ComputerName"],
+            capture_output=True, text=True, timeout=5,
+        )
+        name = result.stdout.strip()
+        return name if name else socket.gethostname()
+    except Exception:
+        return socket.gethostname()
+
+
+def get_connection_info() -> dict:
+    """
+    Identifie le reseau utilise :
+      - Wi-Fi -> nom du reseau (= nom de la flybox si connexion directe)
+      - Ethernet -> pas de "nom de reseau" a proprement parler, on
+        retourne le nom du port materiel a la place
+
+    Retourne {"connection_type": "wifi"|"ethernet"|"unknown", "network_name": str|None}.
+    """
+    try:
+        route_result = subprocess.run(
+            ["route", "get", "default"], capture_output=True, text=True, timeout=5,
+        )
+        iface_match = re.search(r"interface:\s*(\S+)", route_result.stdout)
+        if not iface_match:
+            return {"connection_type": "unknown", "network_name": None}
+        interface = iface_match.group(1)
+
+        hw_result = subprocess.run(
+            ["networksetup", "-listallhardwareports"], capture_output=True, text=True, timeout=5,
+        )
+        hardware_port = None
+        for block in hw_result.stdout.split("\n\n"):
+            if f"Device: {interface}" in block:
+                port_match = re.search(r"Hardware Port:\s*(.+)", block)
+                if port_match:
+                    hardware_port = port_match.group(1).strip()
+                break
+
+        if hardware_port and "Wi-Fi" in hardware_port:
+            ssid_result = subprocess.run(
+                ["networksetup", "-getairportnetwork", interface],
+                capture_output=True, text=True, timeout=5,
+            )
+            ssid_match = re.search(r"Current Wi-Fi Network:\s*(.+)", ssid_result.stdout)
+            network_name = ssid_match.group(1).strip() if ssid_match else None
+            return {"connection_type": "wifi", "network_name": network_name}
+
+        return {"connection_type": "ethernet", "network_name": hardware_port or interface}
+
+    except Exception as e:
+        print(f"[get_connection_info] echec: {e}", file=sys.stderr)
+        return {"connection_type": "unknown", "network_name": None}
 
 
 # --- Ping / latence / jitter / perte de paquets ------------------------
@@ -219,10 +319,14 @@ def run_speedtest() -> dict:
 
 def build_payload(mode: str, modem_id: int, agent_id: str, force: bool) -> dict:
     timestamp = datetime.now(timezone.utc).isoformat()
+    connection_info = get_connection_info()
 
     payload = {
         "modem_id": modem_id,
         "agent_id": agent_id,
+        "device_name": get_device_name(),
+        "connection_type": connection_info["connection_type"],
+        "network_name": connection_info["network_name"],
         "timestamp": timestamp,
         "download_mbps": None,
         "upload_mbps": None,
@@ -239,7 +343,10 @@ def build_payload(mode: str, modem_id: int, agent_id: str, force: bool) -> dict:
         call_status = call_is_active(force=force)
         if call_status["active"]:
             payload["skipped"] = True
-            payload["skip_reason"] = f"appel actif detecte ({call_status['processes']})"
+            if call_status["reason"] == "microphone":
+                payload["skip_reason"] = "microphone actif detecte (probable appel navigateur, ex. Google Meet)"
+            else:
+                payload["skip_reason"] = f"appel actif detecte ({call_status['processes']})"
             return payload
 
         payload.update(run_speedtest())
@@ -300,6 +407,12 @@ def render_comparison_table(payload: dict, evaluation: dict) -> str:
     pret a etre affiche dans le terminal ou ajoute a un fichier .md."""
     lines = []
     lines.append(f"### {payload.get('agent_id')} — modem {payload.get('modem_id')} — {payload.get('timestamp')}")
+    lines.append("")
+    lines.append(f"- **Appareil** : {payload.get('device_name')}")
+    network_label = payload.get("network_name") or "inconnu"
+    lines.append(f"- **Connexion** : {payload.get('connection_type')} — {network_label}")
+    if payload.get("skipped"):
+        lines.append(f"- **Test de debit** : SAUTE — {payload.get('skip_reason')}")
     lines.append("")
     lines.append("| Metrique | Valeur | Warning | Critical | Statut |")
     lines.append("|---|---|---|---|---|")
