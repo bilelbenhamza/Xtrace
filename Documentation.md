@@ -202,3 +202,11 @@ pour tester sans backend.
 pip3 install psutil
 python3 main.py --mode full --force
 
+export NETWORK_PROBE_TOKEN="oIk7nlOzhG7uiPIl"
+
+export NETWORK_PROBE_TOKEN="d5648e68808d18c6c9dc40fdef14f297178d28b05f12abf95975274d594a8a95"
+python3 main.py --mode full --force \
+  --endpoint https://ywinfjuzqipyozzyljil.supabase.co/functions/v1/ingest-metric
+
+
+  ^Ping continue , send whenever it pass or not during the day^

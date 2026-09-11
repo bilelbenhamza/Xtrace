@@ -42,6 +42,11 @@ CLOUDFLARE_UP_URL = "https://speed.cloudflare.com/__up"
 DOWNLOAD_TEST_BYTES = 25_000_000
 UPLOAD_TEST_BYTES = 10_000_000
 
+# --- Identification fixe de CET appareil (Bilel Ben Hamza / Xtern_11) ---
+DEFAULT_MODEM_ID = 11
+DEFAULT_AGENT_ID = "mac-mini-057"
+DEFAULT_DEVICE_NAME = "Bilal Ben Hamza"
+
 # Cloudflare bloque les requetes sans User-Agent "credible" (anti-bot).
 # Le User-Agent par defaut d'urllib ("Python-urllib/3.x") declenche un
 # 403 Forbidden -- on se fait donc passer pour un navigateur standard.
@@ -134,9 +139,11 @@ def call_is_active(force: bool = False) -> dict:
 # --- Identification appareil / reseau -----------------------------------
 
 def get_device_name() -> str:
-    """Nom convivial de la machine (ex. 'MacBook Air de Cyrine'), tel que
-    defini dans Reglages Systeme > Partage. Retombe sur le hostname
-    reseau si indisponible."""
+    """Nom de l'appareil. Utilise DEFAULT_DEVICE_NAME si defini (fixe
+    manuellement en haut du fichier), sinon retombe sur le nom macOS
+    (Reglages Systeme > Partage), sinon le hostname reseau."""
+    if DEFAULT_DEVICE_NAME:
+        return DEFAULT_DEVICE_NAME
     try:
         result = subprocess.run(
             ["scutil", "--get", "ComputerName"],
@@ -146,6 +153,54 @@ def get_device_name() -> str:
         return name if name else socket.gethostname()
     except Exception:
         return socket.gethostname()
+
+
+def get_wifi_ssid(interface: str) -> Optional[str]:
+    """
+    Essaie plusieurs methodes pour recuperer le SSID, car sur les
+    versions recentes de macOS, `networksetup -getairportnetwork` est
+    souvent bloque par les autorisations "Services de localisation" et
+    renvoie un resultat vide meme quand on est bien connecte.
+    """
+    # Methode 1 : networksetup (la plus directe, mais bloquee sans
+    # autorisation "Services de localisation" sur macOS recent)
+    try:
+        result = subprocess.run(
+            ["networksetup", "-getairportnetwork", interface],
+            capture_output=True, text=True, timeout=5,
+        )
+        match = re.search(r"Current Wi-Fi Network:\s*(.+)", result.stdout)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+
+    # Methode 2 : ipconfig getsummary (lit le cache configd, souvent
+    # accessible meme sans l'autorisation ci-dessus)
+    try:
+        result = subprocess.run(
+            ["ipconfig", "getsummary", interface],
+            capture_output=True, text=True, timeout=5,
+        )
+        match = re.search(r"\bSSID\s*:\s*(.+)", result.stdout)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+
+    # Methode 3 : system_profiler (plus lent, mais fiable en dernier recours)
+    try:
+        result = subprocess.run(
+            ["system_profiler", "SPAirPortDataType"],
+            capture_output=True, text=True, timeout=15,
+        )
+        match = re.search(r"Current Network Information:\s*\n\s*([^\n:]+):", result.stdout)
+        if match:
+            return match.group(1).strip()
+    except Exception:
+        pass
+
+    return None
 
 
 def get_connection_info() -> dict:
@@ -178,12 +233,7 @@ def get_connection_info() -> dict:
                 break
 
         if hardware_port and "Wi-Fi" in hardware_port:
-            ssid_result = subprocess.run(
-                ["networksetup", "-getairportnetwork", interface],
-                capture_output=True, text=True, timeout=5,
-            )
-            ssid_match = re.search(r"Current Wi-Fi Network:\s*(.+)", ssid_result.stdout)
-            network_name = ssid_match.group(1).strip() if ssid_match else None
+            network_name = get_wifi_ssid(interface)
             return {"connection_type": "wifi", "network_name": network_name}
 
         return {"connection_type": "ethernet", "network_name": hardware_port or interface}
@@ -355,16 +405,44 @@ def build_payload(mode: str, modem_id: int, agent_id: str, force: bool) -> dict:
     return payload
 
 
-def send_payload(payload: dict, endpoint: str) -> None:
+# Champs exacts attendus par l'API backend (schema communique par le
+# boss). On envoie uniquement ceux-la au backend, meme si le payload
+# local en contient plus (device_name, network_name, evaluation, etc.)
+# -- pour eviter tout rejet du cote serveur si le schema est strict.
+API_SCHEMA_FIELDS = [
+    "modem_id", "agent_id", "timestamp",
+    "download_mbps", "upload_mbps",
+    "latency_ms", "latency_download_ms", "latency_upload_ms",
+    "jitter_ms", "packet_loss_pct",
+]
+
+
+def build_api_payload(payload: dict) -> dict:
+    """Extrait uniquement les champs attendus par l'API backend."""
+    return {key: payload.get(key) for key in API_SCHEMA_FIELDS}
+
+
+def send_payload(payload: dict, endpoint: str, token: Optional[str] = None) -> None:
+    api_payload = build_api_payload(payload)
+    headers = {"Content-Type": "application/json"}
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
     try:
         req = urllib.request.Request(
             endpoint,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            data=json.dumps(api_payload).encode("utf-8"),
+            headers=headers,
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=10, context=SSL_CONTEXT) as resp:
             print(f"-> POST envoye, status: {resp.status}", file=sys.stderr)
+    except urllib.error.HTTPError as e:
+        # Erreur cote serveur (401, 403, 422, ...) -- on affiche le corps
+        # de la reponse, souvent utile pour comprendre pourquoi (schema
+        # invalide, token errone, etc.)
+        body = e.read().decode("utf-8", errors="replace")
+        print(f"-> Echec envoi vers {endpoint}: HTTP {e.code} - {body}", file=sys.stderr)
     except Exception as e:
         print(f"-> Echec envoi vers {endpoint}: {e}", file=sys.stderr)
 
@@ -463,10 +541,15 @@ def sanitize_filename(name: str) -> str:
 def main():
     parser = argparse.ArgumentParser(description="Sonde reseau BPO Tunis")
     parser.add_argument("--mode", choices=["ping", "full"], required=True)
-    parser.add_argument("--modem-id", type=int, default=1)
-    parser.add_argument("--agent-id", type=str, default=socket.gethostname())
+    parser.add_argument("--modem-id", type=int, default=DEFAULT_MODEM_ID)
+    parser.add_argument("--agent-id", type=str, default=DEFAULT_AGENT_ID)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--endpoint", type=str, default=None)
+    parser.add_argument("--token", type=str, default=None,
+                         help="Token d'authentification (Bearer) pour l'API backend. "
+                              "Peut aussi etre fourni via la variable d'environnement "
+                              "NETWORK_PROBE_TOKEN (recommande, pour ne pas laisser le "
+                              "token en clair dans l'historique du terminal).")
     parser.add_argument("--results-dir", type=str, default="results",
                          help="Dossier ou stocker les fichiers de resultats, un par appareil.")
     parser.add_argument("--output-file", type=str, default=None,
@@ -507,7 +590,8 @@ def main():
         save_comparison_to_file(comparison_md, comparison_file)
 
     if args.endpoint:
-        send_payload(payload, args.endpoint)
+        token = args.token or os.environ.get("NETWORK_PROBE_TOKEN")
+        send_payload(payload, args.endpoint, token=token)
 
 
 if __name__ == "__main__":
