@@ -57,3 +57,37 @@
 
 **Statut global : CRITICAL**
 
+### MacBookAir — modem 1 — 2026-09-11T09:49:13.986068+00:00
+
+- **Appareil** : Bolbol's Mac
+- **Connexion** : wifi — inconnu
+
+| Metrique | Valeur | Warning | Critical | Statut |
+|---|---|---|---|---|
+| Jitter | 5.91 ms | > 20 ms | > 30 ms | OK |
+| Perte de paquets | 0.0 % | > 0.5 % | > 1 % | OK |
+| Latence a vide | 30.63 ms | > 100 ms | > 150 ms | OK |
+| Latence sous charge (down) | 38.68 ms | > 150 ms | > 200 ms | OK |
+| Latence sous charge (up) | 306.59 ms | > 150 ms | > 200 ms | CRITICAL |
+| Debit download | 46.15 Mbps | - | - | info |
+| Debit upload | 14.59 Mbps | - | - | info |
+
+**Statut global : CRITICAL**
+
+### MacBookAir — modem 1 — 2026-09-11T10:20:30.312971+00:00
+
+- **Appareil** : Bolbol's Mac
+- **Connexion** : wifi — inconnu
+
+| Metrique | Valeur | Warning | Critical | Statut |
+|---|---|---|---|---|
+| Jitter | 10.96 ms | > 20 ms | > 30 ms | OK |
+| Perte de paquets | 0.0 % | > 0.5 % | > 1 % | OK |
+| Latence a vide | 36.26 ms | > 100 ms | > 150 ms | OK |
+| Latence sous charge (down) | 38.47 ms | > 150 ms | > 200 ms | OK |
+| Latence sous charge (up) | 284.8 ms | > 150 ms | > 200 ms | CRITICAL |
+| Debit download | 49.1 Mbps | - | - | info |
+| Debit upload | 20.41 Mbps | - | - | info |
+
+**Statut global : CRITICAL**
+
